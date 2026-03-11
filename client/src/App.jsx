@@ -1,0 +1,460 @@
+import { useEffect, useRef, useCallback, useState } from 'react';
+import { useGameState } from './hooks/useGameState';
+import { useMusic, resolveTrack } from './hooks/useMusic';
+import { fetchLocations, fetchClues, fetchClueTypes, fetchConfig, createPlayer, loadPlayer, savePlayerState, saveConversation, generateNote, getStoredApiKey, setStoredApiKey, verifyApiKey } from './lib/api';
+import IntroScreen from './components/IntroScreen';
+import GameMap from './components/GameMap';
+import LocationPanel from './components/LocationPanel';
+import ChatPanel from './components/ChatPanel';
+import ClueLog from './components/ClueLog';
+import InvestigationBoard from './components/InvestigationBoard';
+import Notifications from './components/Notifications';
+import MusicPlayer from './components/MusicPlayer';
+import Notebook, { appendNote } from './components/Notebook';
+
+const PLAYERS_KEY = 'roswell_players';
+
+// Migrate old single-player localStorage to new format
+(function migrate() {
+  const oldId = localStorage.getItem('roswell_player_id');
+  if (oldId) {
+    const existing = JSON.parse(localStorage.getItem(PLAYERS_KEY) || '[]');
+    if (!existing.some(p => p.id === oldId)) {
+      existing.push({ id: oldId, name: 'Investigator' });
+      localStorage.setItem(PLAYERS_KEY, JSON.stringify(existing));
+    }
+    localStorage.removeItem('roswell_player_id');
+  }
+})();
+
+export default function App() {
+  const { state, dispatch, loadData } = useGameState();
+  const music = useMusic();
+  const saveTimer = useRef(null);
+  const [clueLogOpen, setClueLogOpen] = useState(false);
+  const [notebookOpen, setNotebookOpen] = useState(false);
+  const [savedPlayers, setSavedPlayers] = useState(() => JSON.parse(localStorage.getItem(PLAYERS_KEY) || '[]'));
+  const [notebookRevision, setNotebookRevision] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [apiKey, setApiKey] = useState(() => getStoredApiKey());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [needsApiKey, setNeedsApiKey] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [settingsKeyStatus, setSettingsKeyStatus] = useState(null);
+
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      document.documentElement.requestFullscreen();
+    }
+  };
+
+  // Load game data
+  useEffect(() => {
+    Promise.all([fetchLocations(), fetchClues(), fetchClueTypes(), fetchConfig()])
+      .then(([locations, clues, clueTypes, config]) => {
+        loadData(locations, clues, clueTypes);
+        if (!config.hasServerKey) {
+          setNeedsApiKey(true);
+          if (!getStoredApiKey()) setSettingsOpen(true);
+        }
+      })
+      .catch(err => console.error('Failed to load game data:', err));
+  }, [loadData]);
+
+  // Switch music based on view and location
+  useEffect(() => {
+    const track = resolveTrack(state.currentView, state.activeLocationId);
+    music.switchTrack(track);
+  }, [state.currentView, state.activeLocationId]);
+
+  // Play stinger when new clues are revealed
+  const prevClueCount = useRef(state.revealedClueIds.length);
+  useEffect(() => {
+    if (state.revealedClueIds.length > prevClueCount.current) {
+      music.playStinger();
+    }
+    prevClueCount.current = state.revealedClueIds.length;
+  }, [state.revealedClueIds.length]);
+
+  // Auto-save player state (debounced)
+  useEffect(() => {
+    if (!state.playerId) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      savePlayerState(state.playerId, {
+        unlockedLocations: state.unlockedLocationIds,
+        revealedClues: state.revealedClueIds,
+        revealedNames: state.revealedNames,
+        characterSummaries: state.characterSummaries,
+      }).catch(() => {});
+    }, 1000);
+  }, [state.playerId, state.unlockedLocationIds, state.revealedClueIds, state.revealedNames, state.characterSummaries]);
+
+  // Save conversation when it changes
+  const handleSaveConversation = useCallback((characterId) => {
+    if (!state.playerId) return;
+    const msgs = state.conversations[characterId];
+    if (msgs?.length) {
+      saveConversation(state.playerId, characterId, msgs).catch(() => {});
+    }
+  }, [state.playerId, state.conversations]);
+
+  // Handle start — create new player
+  const handleStart = async (playerName) => {
+    setSettingsOpen(false);
+    const player = await createPlayer(playerName);
+    const updated = [...savedPlayers, { id: player.id, name: player.name }];
+    localStorage.setItem(PLAYERS_KEY, JSON.stringify(updated));
+    setSavedPlayers(updated);
+    dispatch({ type: 'LOAD_PLAYER', player });
+    dispatch({ type: 'SET_VIEW', view: 'map' });
+  };
+
+  // Handle resume — load existing player
+  const handleResume = async (playerId) => {
+    setSettingsOpen(false);
+    const player = await loadPlayer(playerId);
+    if (player) {
+      dispatch({ type: 'LOAD_PLAYER', player });
+      dispatch({ type: 'SET_VIEW', view: 'map' });
+    } else {
+      // Player no longer exists in DB — remove from localStorage
+      const updated = savedPlayers.filter(p => p.id !== playerId);
+      localStorage.setItem(PLAYERS_KEY, JSON.stringify(updated));
+      setSavedPlayers(updated);
+    }
+  };
+
+  // Handle delete saved player
+  const handleDeletePlayer = (playerId) => {
+    const updated = savedPlayers.filter(p => p.id !== playerId);
+    localStorage.setItem(PLAYERS_KEY, JSON.stringify(updated));
+    setSavedPlayers(updated);
+  };
+
+  if (!state.dataLoaded) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-noir-950">
+        <p className="font-mono text-zinc-500 animate-pulse">Loading...</p>
+      </div>
+    );
+  }
+
+  if (state.currentView === 'intro') {
+    return (
+      <IntroScreen
+        onStart={handleStart}
+        onResume={handleResume}
+        onDeletePlayer={handleDeletePlayer}
+        savedPlayers={savedPlayers}
+        music={music}
+        needsApiKey={needsApiKey}
+      />
+    );
+  }
+
+  return (
+    <div className="h-screen flex flex-col bg-noir-950 overflow-hidden">
+      {/* Map is always rendered underneath */}
+      <div className="flex-1 relative overflow-hidden">
+        <GameMap
+          locations={state.locations}
+          unlockedLocationIds={state.unlockedLocationIds}
+          onLocationClick={(id) => dispatch({ type: 'OPEN_LOCATION', locationId: id })}
+        />
+
+        {/* Side panels */}
+        {state.currentView === 'location' && state.activeLocationId && (
+          <LocationPanel
+            locationId={state.activeLocationId}
+            locations={state.locations}
+            revealedNames={state.revealedNames}
+            characterSummaries={state.characterSummaries}
+            onBack={() => dispatch({ type: 'SET_VIEW', view: 'map' })}
+            onCharacterClick={(id) => dispatch({ type: 'OPEN_CHAT', characterId: id })}
+          />
+        )}
+
+        {state.currentView === 'chat' && state.activeCharacterId && (
+          <ChatPanel
+            characterId={state.activeCharacterId}
+            locationId={state.activeLocationId}
+            locations={state.locations}
+            conversations={state.conversations}
+            revealedClueIds={state.revealedClueIds}
+            revealedNames={state.revealedNames}
+            characterSummaries={state.characterSummaries}
+            isLoading={state.isLoading}
+            dispatch={dispatch}
+            onSaveConversation={handleSaveConversation}
+            onAddNote={async (characterName, message) => {
+              setNotebookOpen(true);
+              const note = await generateNote(characterName, message);
+              if (note) {
+                await appendNote(state.playerId, note);
+                setNotebookRevision(r => r + 1);
+              }
+            }}
+          />
+        )}
+
+        {/* Notebook */}
+        <Notebook
+          playerId={state.playerId}
+          isOpen={notebookOpen}
+          revision={notebookRevision}
+          onClose={() => setNotebookOpen(false)}
+        />
+
+        {/* Clue log panel */}
+        <ClueLog
+          clues={state.clues}
+          clueTypes={state.clueTypes}
+          revealedClueIds={state.revealedClueIds}
+          isOpen={clueLogOpen}
+          onClose={() => setClueLogOpen(false)}
+        />
+
+        {/* Investigation board overlay */}
+        {state.currentView === 'board' && (
+          <InvestigationBoard
+            clues={state.clues}
+            clueTypes={state.clueTypes}
+            revealedClueIds={state.revealedClueIds}
+            conversations={state.conversations}
+            revealedNames={state.revealedNames}
+            characterSummaries={state.characterSummaries}
+            locations={state.locations}
+            playerId={state.playerId}
+            onClose={() => dispatch({ type: 'SET_VIEW', view: 'map' })}
+          />
+        )}
+
+        {/* Toast notifications */}
+        <Notifications
+          notifications={state.pendingNotifications}
+          locations={state.locations}
+          onDismiss={(id) => dispatch({ type: 'DISMISS_NOTIFICATION', notificationId: id })}
+        />
+      </div>
+
+      {/* Desktop bottom toolbar — hidden on mobile */}
+      <div className="hidden md:flex h-12 bg-noir-900 border-t border-noir-700 items-center justify-between px-4 shrink-0 z-30">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setClueLogOpen(o => !o)}
+            className="font-mono text-xs text-zinc-400 hover:text-clue transition-colors
+                       flex items-center gap-2 px-3 py-1.5 rounded border border-noir-700
+                       hover:border-clue/30 bg-noir-800"
+          >
+            <span>Clues</span>
+            {state.revealedClueIds.length > 0 && (
+              <span className="bg-clue/20 text-clue px-1.5 py-0.5 rounded text-xs">
+                {state.revealedClueIds.length}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setNotebookOpen(o => !o)}
+            className="font-mono text-xs text-zinc-400 hover:text-zinc-200 transition-colors
+                       flex items-center gap-2 px-3 py-1.5 rounded border border-noir-700
+                       hover:border-zinc-500 bg-noir-800"
+          >
+            Notebook
+          </button>
+          {state.revealedClueIds.length >= 2 && (
+            <button
+              onClick={() => dispatch({ type: 'SET_VIEW', view: 'board' })}
+              className="font-mono text-xs text-zinc-400 hover:text-blood transition-colors
+                         flex items-center gap-2 px-3 py-1.5 rounded border border-noir-700
+                         hover:border-blood/30 bg-noir-800"
+            >
+              Investigation Board
+            </button>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          <MusicPlayer
+            muted={music.muted}
+            toggleMute={music.toggleMute}
+            volume={music.volume}
+            setVolume={music.setVolume}
+            inline
+          />
+          <div className="relative">
+            <button
+              onClick={() => setSettingsOpen(o => !o)}
+              className="text-zinc-500 hover:text-zinc-300 transition-colors"
+              title="Settings"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <circle cx="8" cy="8" r="2.5" />
+                <path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4" />
+              </svg>
+            </button>
+            {settingsOpen && (
+              <div className="absolute bottom-full right-0 mb-2 w-72 bg-noir-800 border border-noir-600 rounded-lg p-3 shadow-xl z-50">
+                <label className="block font-mono text-[11px] text-zinc-400 mb-1">
+                  OpenRouter API Key
+                </label>
+                <div className="flex gap-1.5">
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => {
+                      setApiKey(e.target.value);
+                      setSettingsKeyStatus(null);
+                    }}
+                    placeholder="sk-or-..."
+                    className="flex-1 bg-noir-900 border border-noir-600 rounded px-2 py-1.5 font-mono text-xs text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+                  />
+                  <button
+                    onClick={async () => {
+                      if (!apiKey.trim()) return;
+                      setSettingsKeyStatus('checking');
+                      const ok = await verifyApiKey(apiKey.trim());
+                      if (ok) {
+                        setStoredApiKey(apiKey.trim());
+                        setSettingsKeyStatus('valid');
+                      } else {
+                        setSettingsKeyStatus('invalid');
+                      }
+                    }}
+                    disabled={!apiKey.trim() || settingsKeyStatus === 'checking'}
+                    className="px-2 py-1.5 font-mono text-[10px] border border-noir-600 rounded bg-noir-900 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors disabled:opacity-30"
+                  >
+                    {settingsKeyStatus === 'checking' ? '...' : 'Verify'}
+                  </button>
+                </div>
+                {settingsKeyStatus === 'valid' && (
+                  <p className="font-mono text-[10px] text-green-500 mt-1">Key verified and saved.</p>
+                )}
+                {settingsKeyStatus === 'invalid' && (
+                  <p className="font-mono text-[10px] text-blood mt-1">Invalid key.</p>
+                )}
+                {!settingsKeyStatus && (
+                  <p className="font-mono text-[10px] text-zinc-600 mt-1">
+                    {getStoredApiKey() ? 'Key saved. Enter a new one to change it.' : 'Get your key at openrouter.ai/keys'}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={toggleFullscreen}
+            className="text-zinc-500 hover:text-zinc-300 transition-colors"
+            title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+          >
+            {isFullscreen ? (
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M5 1v4H1M11 1v4h4M5 15v-4H1M11 15v-4h4" />
+              </svg>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M1 5V1h4M11 1h4v4M1 11v4h4M15 11v4h-4" />
+              </svg>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Mobile floating hamburger button */}
+      <div className="md:hidden fixed bottom-4 right-4 z-[70]">
+        <button
+          onClick={() => setMobileMenuOpen(o => !o)}
+          className="w-12 h-12 rounded-full bg-noir-900 border border-noir-600 shadow-xl
+                     flex items-center justify-center text-zinc-300 active:scale-95 transition-transform"
+        >
+          {mobileMenuOpen ? (
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M5 5l10 10M15 5L5 15" />
+            </svg>
+          ) : (
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 6h14M3 10h14M3 14h14" />
+            </svg>
+          )}
+          {!mobileMenuOpen && state.revealedClueIds.length > 0 && (
+            <span className="absolute -top-1 -left-1 bg-clue text-noir-950 text-[10px] font-bold w-5 h-5 rounded-full flex items-center justify-center">
+              {state.revealedClueIds.length}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* Mobile slide-up menu */}
+      {mobileMenuOpen && (
+        <div className="md:hidden fixed inset-0 z-[65]" onClick={() => setMobileMenuOpen(false)}>
+          <div className="absolute inset-0 bg-black/50" />
+          <div
+            className="absolute bottom-0 left-0 right-0 bg-noir-900 border-t border-noir-700 rounded-t-2xl p-5 pb-8 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+            style={{ animation: 'slideUp 0.2s ease-out' }}
+          >
+            <div className="w-10 h-1 bg-noir-600 rounded-full mx-auto mb-4" />
+
+            <button
+              onClick={() => { setClueLogOpen(o => !o); setMobileMenuOpen(false); }}
+              className="w-full flex items-center justify-between px-4 py-3 rounded-lg
+                         bg-noir-800 border border-noir-700 active:bg-noir-700"
+            >
+              <span className="font-mono text-sm text-zinc-300">Clues</span>
+              {state.revealedClueIds.length > 0 && (
+                <span className="bg-clue/20 text-clue px-2 py-0.5 rounded text-xs font-mono">
+                  {state.revealedClueIds.length}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => { setNotebookOpen(o => !o); setMobileMenuOpen(false); }}
+              className="w-full flex items-center px-4 py-3 rounded-lg
+                         bg-noir-800 border border-noir-700 active:bg-noir-700"
+            >
+              <span className="font-mono text-sm text-zinc-300">Notebook</span>
+            </button>
+
+            {state.revealedClueIds.length >= 2 && (
+              <button
+                onClick={() => { dispatch({ type: 'SET_VIEW', view: 'board' }); setMobileMenuOpen(false); }}
+                className="w-full flex items-center px-4 py-3 rounded-lg
+                           bg-noir-800 border border-noir-700 active:bg-noir-700"
+              >
+                <span className="font-mono text-sm text-blood">Investigation Board</span>
+              </button>
+            )}
+
+            <div className="flex items-center justify-between px-4 py-3 rounded-lg bg-noir-800 border border-noir-700">
+              <span className="font-mono text-sm text-zinc-300">Music</span>
+              <MusicPlayer
+                muted={music.muted}
+                toggleMute={music.toggleMute}
+                volume={music.volume}
+                setVolume={music.setVolume}
+                inline
+              />
+            </div>
+
+            {state.currentView !== 'map' && (
+              <button
+                onClick={() => { dispatch({ type: 'SET_VIEW', view: 'map' }); setMobileMenuOpen(false); }}
+                className="w-full flex items-center px-4 py-3 rounded-lg
+                           bg-noir-800 border border-noir-700 active:bg-noir-700"
+              >
+                <span className="font-mono text-sm text-zinc-300">Back to map</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+server/db/*.db
+server/db/*.db-shm
+server/db/*.db-wal
+.env
+.DS_Store
+client/public/images_backup/
+musik/
+client/public/images/clues/clue_jfk_premonition.jpg
+client/public/images/locations/dealey_plaza.jpg
+client/public/images/locations/dealey_plaza_periphery.jpg
